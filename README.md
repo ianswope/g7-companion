@@ -172,7 +172,7 @@ Tests:
 
 ```bash
 python3 -m unittest discover -s tests   # Share client, against a local fake
-node --test tests/                      # widget logic
+node --test tests/model.test.mjs        # widget logic
 cd tray && cargo test                   # Rust client and poller, same scenarios
 ```
 
