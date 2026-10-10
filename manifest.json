@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "id": "ianswope.g7-companion",
+  "name": "G7 Companion",
+  "version": "0.1.0",
+  "author": "Ian Swope",
+  "license": "MIT",
+  "description": "The latest Dexcom G7 glucose reading in the bar, read from Dexcom Share the way the Follow app does, with trend, age and a three-hour sparkline. For parents and partners following someone's CGM.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "G7 Companion",
+    "description": "Dexcom G7 reading, trend arrow and age. Goes grey when the reading stops updating. Click for the last few hours; middle-click to refresh.",
+    "category": "Health",
+    "aliases": ["dexcom", "g7", "cgm", "glucose", "diabetes", "blood sugar", "follow"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "unit": "mgdl",
+      "low": 70,
+      "high": 180,
+      "urgentLow": 55,
+      "refreshSec": 60,
+      "staleMinutes": 10,
+      "historyMinutes": 180,
+      "showTrend": true,
+      "alwaysShowAge": false
+    },
+    "schema": [
+      {
+        "key": "unit",
+        "type": "enum",
+        "label": "Units",
+        "options": ["mgdl", "mmol"],
+        "defaultValue": "mgdl",
+        "description": "mg/dL or mmol/L. Thresholds below are always entered in mg/dL."
+      },
+      {
+        "key": "low",
+        "type": "integer",
+        "label": "Low (mg/dL)",
+        "description": "Below this the reading turns the theme's urgent colour. Match the low alert in the Follow app.",
+        "min": 50,
+        "max": 150,
+        "defaultValue": 70
+      },
+      {
+        "key": "high",
+        "type": "integer",
+        "label": "High (mg/dL)",
+        "description": "Above this the reading turns amber. Match the high alert in the Follow app.",
+        "min": 120,
+        "max": 400,
+        "defaultValue": 180
+      },
+      {
+        "key": "urgentLow",
+        "type": "integer",
+        "label": "Urgent low (mg/dL)",
+        "min": 40,
+        "max": 100,
+        "defaultValue": 55
+      },
+      {
+        "key": "refreshSec",
+        "type": "integer",
+        "label": "Check every (seconds)",
+        "description": "The G7 posts every five minutes and Share lags the phone by a minute or two, so faster than 60 gains nothing.",
+        "min": 30,
+        "max": 600,
+        "defaultValue": 60
+      },
+      {
+        "key": "staleMinutes",
+        "type": "integer",
+        "label": "Grey out after (minutes)",
+        "description": "A reading older than this is drawn grey with its age, whatever its value.",
+        "min": 6,
+        "max": 60,
+        "defaultValue": 10
+      },
+      {
+        "key": "historyMinutes",
+        "type": "integer",
+        "label": "Sparkline span (minutes)",
+        "min": 60,
+        "max": 720,
+        "defaultValue": 180
+      },
+      {
+        "key": "showTrend",
+        "type": "boolean",
+        "label": "Show the trend arrow in the bar",
+        "defaultValue": true
+      },
+      {
+        "key": "alwaysShowAge",
+        "type": "boolean",
+        "label": "Always show the reading's age in the bar",
+        "description": "Off shows the age only once the reading is stale.",
+        "defaultValue": false
+      }
+    ]
+  },
+  "repository": "https://github.com/ianswope/g7-companion"
+}

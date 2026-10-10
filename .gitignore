@@ -1,0 +1,5 @@
+/tray/target/
+__pycache__/
+*.pyc
+/dist/
+.DS_Store

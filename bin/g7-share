@@ -1,0 +1,699 @@
+#!/usr/bin/python3 -I
+"""Dexcom Share client for G7 Companion.
+
+Standard library only, so the Omarchy plugin installs with nothing to build.
+The protocol is written down in docs/share-api.md; this file implements it.
+
+    g7-share login [--account-id] [--stdin]   sign in (asks on the terminal)
+    g7-share read [--minutes N] [--max-count N]
+    g7-share status
+    g7-share logout
+
+Everything the shell consumes is one JSON document on stdout. Nothing secret
+is ever printed, logged, or placed in a command line. Credentials live in
+~/.config/g7-companion/credentials.json, mode 600 inside a mode 700 directory,
+and the Dexcom session is cached under ~/.local/state/g7-companion so the
+account is not re-authenticated on every poll.
+"""
+
+import getpass
+import json
+import os
+import pwd
+import re
+import secrets
+import ssl
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+APP_ID = "d89443d2-327c-4a6f-89e5-496bbb0317db"
+BASES = {
+    "us": "https://share2.dexcom.com/ShareWebServices/Services",
+    "ous": "https://shareous1.dexcom.com/ShareWebServices/Services",
+    "jp": "https://share.dexcom.jp/ShareWebServices/Services",
+}
+USER_AGENT = "G7-Companion/0.1 (+https://github.com/ianswope/g7-companion)"
+
+AUTH_MAX_BYTES = 4096
+READ_MAX_BYTES = 256 * 1024
+FILE_MAX_BYTES = 256 * 1024
+HTTP_TIMEOUT = 10
+TOTAL_DEADLINE = 28
+
+TREND_BY_INT = {
+    0: "None", 1: "DoubleUp", 2: "SingleUp", 3: "FortyFiveUp", 4: "Flat",
+    5: "FortyFiveDown", 6: "SingleDown", 7: "DoubleDown", 8: "NotComputable",
+    9: "RateOutOfRange",
+}
+TRENDS = set(TREND_BY_INT.values())
+NULL_UUID = "00000000-0000-0000-0000-000000000000"
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+SESSION_GONE = {"SessionIdNotFound", "SessionNotValid"}
+BAD_CREDENTIALS = {
+    "SSO_AuthenticateAccountNotFound": "Dexcom does not know that account name.",
+    "SSO_AuthenticatePasswordInvalid": "Dexcom rejected the password.",
+    "AccountPasswordInvalid": "Dexcom rejected the password.",
+}
+LOCKOUT_CODE = "SSO_AuthenticateMaxAttemptsExceeed"
+LOCKOUT_SECONDS = 30 * 60
+TRANSIENT_BACKOFF_SECONDS = 90
+
+
+class ShareError(Exception):
+    def __init__(self, code, message, *, needs_login=False, retry_after=0):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.needs_login = needs_login
+        self.retry_after = retry_after
+
+
+# ---------------------------------------------------------------- files
+
+def _uid():
+    return os.geteuid()
+
+
+def _home():
+    # The passwd entry, not $HOME: a same-user process can point $HOME anywhere.
+    return pwd.getpwuid(_uid()).pw_dir
+
+
+def open_dir_chain(parts):
+    """Walk from the home directory holding a descriptor at every step.
+
+    Parent components (.config, .local/state) may be symlinks the user set up
+    on purpose, so they are followed but must be directories this user owns.
+    The leaf is this tool's own directory: never a symlink, always mode 700,
+    and anything inside it that is not a regular file is removed.
+    """
+    fd = os.open(_home(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for i, name in enumerate(parts):
+            leaf = i == len(parts) - 1
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | (os.O_NOFOLLOW if leaf else 0)
+            try:
+                nfd = os.open(name, flags, dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(name, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nfd = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != _uid():
+                raise PermissionError("refusing directory %s: not a directory this user owns" % name)
+            if leaf:
+                if st.st_mode & 0o077:
+                    os.fchmod(fd, 0o700)
+                _repair_leaf(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _repair_leaf(dirfd):
+    with os.scandir(dirfd) as it:
+        for entry in it:
+            if entry.is_file(follow_symlinks=False):
+                try:
+                    ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dirfd)
+                except OSError:
+                    continue
+                try:
+                    fst = os.fstat(ffd)
+                    if stat.S_ISREG(fst.st_mode) and fst.st_mode & 0o077:
+                        os.fchmod(ffd, 0o600)
+                finally:
+                    os.close(ffd)
+            else:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        os.rmdir(entry.name, dir_fd=dirfd)
+                    else:
+                        os.unlink(entry.name, dir_fd=dirfd)
+                except OSError:
+                    pass
+
+
+def read_json(dirfd, name):
+    """Return the parsed JSON object in name, or None if it does not exist."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+    except FileNotFoundError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != _uid() or st.st_nlink != 1
+                or st.st_size > FILE_MAX_BYTES):
+            raise PermissionError("refusing %s: expected a private regular file" % name)
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o600)
+        os.set_blocking(fd, True)
+        data = b""
+        while len(data) <= FILE_MAX_BYTES:
+            chunk = os.read(fd, min(65536, FILE_MAX_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > FILE_MAX_BYTES:
+            raise PermissionError("%s grew past the limit" % name)
+    finally:
+        os.close(fd)
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def write_json(dirfd, name, doc):
+    data = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+    if len(data) > FILE_MAX_BYTES:
+        raise ValueError("payload too large")
+    tmp = ".%s.%s.tmp" % (name, secrets.token_hex(8))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dirfd)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+        os.fsync(fd)
+        os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def remove_file(dirfd, name):
+    try:
+        os.unlink(name, dir_fd=dirfd)
+    except FileNotFoundError:
+        pass
+
+
+class Dirs:
+    def __init__(self):
+        self.config = open_dir_chain([".config", "g7-companion"])
+        self.state = open_dir_chain([".local", "state", "g7-companion"])
+
+    def close(self):
+        os.close(self.config)
+        os.close(self.state)
+
+
+# ---------------------------------------------------------------- network
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _base_url(region):
+    # Fixed origins only. The credentials go to whatever this returns, so it
+    # is never read from the environment, a setting or a response.
+    return BASES[region]
+
+
+def _post(url, body, max_bytes):
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", USER_AGENT)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    ctx = ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        _NoRedirect(),
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
+    try:
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as err:
+        try:
+            raw = err.read(AUTH_MAX_BYTES + 1)
+        finally:
+            err.close()
+        raise _dexcom_error(err.code, raw) from None
+    except urllib.error.URLError as err:
+        raise ShareError("network", "Could not reach Dexcom: %s" % _reason(err)) from None
+    except (OSError, ValueError) as err:
+        raise ShareError("network", "Could not reach Dexcom: %s" % _reason(err)) from None
+    if len(raw) > max_bytes:
+        raise ShareError("oversize", "Dexcom sent more data than expected.")
+    try:
+        return json.loads(raw.decode("utf-8")) if raw.strip() else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ShareError("malformed", "Dexcom sent something that was not JSON.") from None
+
+
+def _reason(err):
+    text = str(getattr(err, "reason", None) or err)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    return text[:160]
+
+
+def _dexcom_error(status, raw):
+    code = ""
+    message = ""
+    if len(raw) <= AUTH_MAX_BYTES:
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+            if isinstance(doc, dict):
+                code = str(doc.get("Code", ""))[:64]
+                message = str(doc.get("Message", ""))[:200]
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+    if code in SESSION_GONE:
+        return ShareError("session", "Dexcom session expired.")
+    if code in BAD_CREDENTIALS:
+        return ShareError(code, BAD_CREDENTIALS[code], needs_login=True)
+    if code == LOCKOUT_CODE:
+        return ShareError(code, "Too many sign-in attempts. Dexcom has locked sign-in for a while.",
+                          retry_after=int(time.time()) + LOCKOUT_SECONDS)
+    if code:
+        return ShareError(code, "Dexcom returned %s." % code)
+    return ShareError("http_%d" % status, "Dexcom answered with HTTP %d." % status)
+
+
+def authenticate(base, account_name, password):
+    doc = _post(base + "/General/AuthenticatePublisherAccount",
+                {"accountName": account_name, "password": password, "applicationId": APP_ID},
+                AUTH_MAX_BYTES)
+    if not isinstance(doc, str) or not UUID_RE.match(doc):
+        raise ShareError("malformed", "Dexcom did not return an account ID.")
+    if doc == NULL_UUID:
+        raise ShareError("SSO_AuthenticateAccountNotFound",
+                         BAD_CREDENTIALS["SSO_AuthenticateAccountNotFound"], needs_login=True)
+    return doc
+
+
+def login(base, account_id, password):
+    doc = _post(base + "/General/LoginPublisherAccountById",
+                {"accountId": account_id, "password": password, "applicationId": APP_ID},
+                AUTH_MAX_BYTES)
+    if not isinstance(doc, str) or not UUID_RE.match(doc):
+        raise ShareError("malformed", "Dexcom did not return a session ID.")
+    if doc == NULL_UUID:
+        raise ShareError("AccountPasswordInvalid", BAD_CREDENTIALS["AccountPasswordInvalid"], needs_login=True)
+    return doc
+
+
+def fetch_readings(base, session_id, minutes, max_count):
+    query = urllib.parse.urlencode({"sessionId": session_id, "minutes": minutes, "maxCount": max_count})
+    doc = _post(base + "/Publisher/ReadPublisherLatestGlucoseValues?" + query, None, READ_MAX_BYTES)
+    if doc is None:
+        doc = []
+    if not isinstance(doc, list):
+        raise ShareError("malformed", "Dexcom did not return a list of readings.")
+    out = []
+    for item in doc[:288]:
+        reading = _normalize(item)
+        if reading is not None:
+            out.append(reading)
+    out.sort(key=lambda r: r["t"], reverse=True)
+    return out
+
+
+_WT_RE = re.compile(r"^/?Date\((-?\d{1,16})(?:[+-]\d{4})?\)/?$")
+
+
+def _normalize(item):
+    if not isinstance(item, dict):
+        return None
+    wt = item.get("WT")
+    if not isinstance(wt, str):
+        return None
+    m = _WT_RE.match(wt)
+    if not m:
+        return None
+    t = int(m.group(1)) // 1000
+    if t < 1_400_000_000 or t > 4_000_000_000:
+        return None
+    value = item.get("Value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = int(value)
+    if value < 20 or value > 600:
+        return None
+    trend = item.get("Trend")
+    if isinstance(trend, bool):
+        trend = "None"
+    elif isinstance(trend, int):
+        trend = TREND_BY_INT.get(trend, "None")
+    elif isinstance(trend, str):
+        trend = trend if trend in TRENDS else "None"
+    else:
+        trend = "None"
+    return {"t": t, "v": value, "trend": trend}
+
+
+# ---------------------------------------------------------------- state
+
+def load_credentials(dirs):
+    doc = read_json(dirs.config, "credentials.json")
+    if not doc or doc.get("version") != 1:
+        return None
+    region = doc.get("region")
+    password = doc.get("password")
+    name = doc.get("account_name")
+    account_id = doc.get("account_id")
+    if region not in BASES or not isinstance(password, str) or not password:
+        return None
+    if not ((isinstance(name, str) and name) or (isinstance(account_id, str) and UUID_RE.match(account_id))):
+        return None
+    return {"region": region, "password": password,
+            "account_name": name if isinstance(name, str) else None,
+            "account_id": account_id if isinstance(account_id, str) else None}
+
+
+def account_label(creds):
+    if not creds:
+        return ""
+    name = creds.get("account_name") or ""
+    if "@" in name:
+        local, _, domain = name.partition("@")
+        return (local[:1] + "***@" + domain)[:80]
+    if name:
+        return ("***" + name[-4:]) if len(name) > 4 else "***"
+    return "account ID"
+
+
+def now():
+    return int(time.time())
+
+
+def _backoff(dirs):
+    doc = read_json(dirs.state, "backoff.json") or {}
+    until = doc.get("until")
+    if isinstance(until, int) and until > now() and until < now() + 86400:
+        return until, str(doc.get("message", ""))[:200], str(doc.get("code", ""))[:64]
+    return 0, "", ""
+
+
+def _set_backoff(dirs, until, code, message):
+    write_json(dirs.state, "backoff.json", {"until": int(until), "code": code, "message": message})
+
+
+def _auth_failure(dirs):
+    doc = read_json(dirs.state, "auth.json")
+    if doc and doc.get("failed") is True:
+        return str(doc.get("message", "Sign in again."))[:200]
+    return ""
+
+
+def _cached(dirs):
+    doc = read_json(dirs.state, "last.json") or {}
+    readings = doc.get("readings")
+    fetched = doc.get("fetched_at")
+    if not isinstance(readings, list) or not isinstance(fetched, int):
+        return 0, []
+    clean = []
+    for item in readings[:288]:
+        if (isinstance(item, dict) and isinstance(item.get("t"), int) and isinstance(item.get("v"), int)
+                and item.get("trend") in TRENDS and not isinstance(item.get("v"), bool)):
+            clean.append({"t": item["t"], "v": item["v"], "trend": item["trend"]})
+    return fetched, clean
+
+
+def _session_for(dirs, creds, base):
+    """Return a session ID, logging in only when the cache has none."""
+    doc = read_json(dirs.state, "session.json") or {}
+    sid = doc.get("session_id")
+    account_id = doc.get("account_id")
+    if isinstance(sid, str) and UUID_RE.match(sid) and account_id == (creds["account_id"] or doc.get("account_id")):
+        if sid != NULL_UUID:
+            return sid, False
+    return _new_session(dirs, creds, base), True
+
+
+def _new_session(dirs, creds, base):
+    account_id = creds["account_id"]
+    if not account_id:
+        account_id = authenticate(base, creds["account_name"], creds["password"])
+    sid = login(base, account_id, creds["password"])
+    write_json(dirs.state, "session.json", {"session_id": sid, "account_id": account_id, "created_at": now()})
+    return sid
+
+
+def read_latest(dirs, minutes, max_count):
+    creds = load_credentials(dirs)
+    fetched_at, cached = _cached(dirs)
+    if creds is None:
+        return {"ok": False, "error": "signed_out", "message": "Not signed in.", "needs_login": True,
+                "readings": [], "fetched_at": 0, "source": "none"}
+    failure = _auth_failure(dirs)
+    if failure:
+        return {"ok": False, "error": "auth", "message": failure, "needs_login": True,
+                "readings": cached, "fetched_at": fetched_at, "source": "cache",
+                "account": account_label(creds)}
+    until, message, code = _backoff(dirs)
+    if until:
+        return {"ok": False, "error": code or "backoff", "message": message or "Waiting before trying Dexcom again.",
+                "needs_login": False, "retry_after": until, "readings": cached, "fetched_at": fetched_at,
+                "source": "cache", "account": account_label(creds)}
+
+    base = _base_url(creds["region"])
+    started = time.monotonic()
+    try:
+        sid, fresh = _session_for(dirs, creds, base)
+        try:
+            readings = fetch_readings(base, sid, minutes, max_count)
+        except ShareError as err:
+            if err.code != "session" or fresh or time.monotonic() - started > TOTAL_DEADLINE - HTTP_TIMEOUT:
+                raise
+            remove_file(dirs.state, "session.json")
+            sid = _new_session(dirs, creds, base)
+            readings = fetch_readings(base, sid, minutes, max_count)
+    except ShareError as err:
+        if err.needs_login:
+            write_json(dirs.state, "auth.json", {"failed": True, "code": err.code, "message": err.message, "at": now()})
+            remove_file(dirs.state, "session.json")
+        elif err.retry_after:
+            _set_backoff(dirs, err.retry_after, err.code, err.message)
+        elif err.code in ("network", "oversize", "malformed") or err.code.startswith("http_"):
+            _set_backoff(dirs, now() + TRANSIENT_BACKOFF_SECONDS, err.code, err.message)
+        return {"ok": False, "error": err.code, "message": err.message, "needs_login": err.needs_login,
+                "retry_after": err.retry_after, "readings": cached, "fetched_at": fetched_at,
+                "source": "cache", "account": account_label(creds)}
+
+    remove_file(dirs.state, "backoff.json")
+    write_json(dirs.state, "last.json", {"fetched_at": now(), "readings": readings[:288]})
+    return {"ok": True, "readings": readings, "fetched_at": now(), "source": "live",
+            "account": account_label(creds), "region": creds["region"]}
+
+
+# ---------------------------------------------------------------- commands
+
+def _emit(doc):
+    sys.stdout.write(json.dumps(doc, separators=(",", ":")))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _int_arg(args, flag, default, low, high):
+    if flag in args:
+        i = args.index(flag)
+        try:
+            value = int(args[i + 1])
+        except (IndexError, ValueError):
+            return default
+        return max(low, min(high, value))
+    return default
+
+
+def cmd_read(dirs, args):
+    minutes = _int_arg(args, "--minutes", 180, 1, 1440)
+    max_count = _int_arg(args, "--max-count", 36, 1, 288)
+    _emit(read_latest(dirs, minutes, max_count))
+    return 0
+
+
+def cmd_status(dirs, args):
+    creds = load_credentials(dirs)
+    until, message, code = _backoff(dirs)
+    fetched_at, cached = _cached(dirs)
+    _emit({
+        "signed_in": creds is not None,
+        "account": account_label(creds),
+        "region": creds["region"] if creds else "",
+        "auth_failed": bool(_auth_failure(dirs)),
+        "backoff_until": until,
+        "last_fetched_at": fetched_at,
+        "cached_readings": len(cached),
+    })
+    return 0
+
+
+def cmd_logout(dirs, args):
+    remove_file(dirs.config, "credentials.json")
+    for name in ("session.json", "auth.json", "backoff.json", "last.json"):
+        remove_file(dirs.state, name)
+    _emit({"ok": True, "message": "Signed out. Credentials and cached readings removed."})
+    return 0
+
+
+def _clean_line(text, limit):
+    text = text.strip()
+    if any(ch in text for ch in "\r\n\x00"):
+        return ""
+    return text[:limit]
+
+
+def _login_report(interactive, doc, rc):
+    if not interactive:
+        _emit(doc)
+        return rc
+    err = sys.stderr
+    if doc.get("ok"):
+        latest = doc.get("latest")
+        err.write("\nSigned in as %s.\n" % doc.get("account", ""))
+        if latest:
+            age = max(0, now() - latest["t"]) // 60
+            err.write("Latest reading: %d mg/dL, %s, %d min ago.\n" % (latest["v"], latest["trend"], age))
+        else:
+            err.write("No reading in the last 24 hours. Check that Share is on in the G7 app.\n")
+        err.write("The bar will pick it up within a few seconds.\n")
+    else:
+        err.write("\nSign-in failed: %s\n" % doc.get("message", "unknown error"))
+        if doc.get("code") in ("SSO_AuthenticateAccountNotFound", "SSO_AuthenticatePasswordInvalid"):
+            err.write("If the password is right, try signing in with the account ID instead:\n"
+                      "sign in at uam1.dexcom.com (US) or uam2.dexcom.com (elsewhere) and copy\n"
+                      "the long ID from the address bar. Too many failed tries lock the account\n"
+                      "for a while, on the wearer's phone too, so stop after two or three.\n")
+    try:
+        input("\nPress Enter to close.")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return rc
+
+
+def cmd_login(dirs, args):
+    use_id = "--account-id" in args
+    interactive = "--stdin" not in args
+    if not interactive:
+        try:
+            doc = json.loads(sys.stdin.read(AUTH_MAX_BYTES))
+        except (ValueError, UnicodeDecodeError):
+            return _login_report(interactive, {"ok": False, "message": "Expected a JSON object on stdin."}, 2)
+        region = doc.get("region", "us")
+        name = _clean_line(str(doc.get("account_name", "")), 200)
+        account_id = _clean_line(str(doc.get("account_id", "")), 36)
+        password = str(doc.get("password", ""))
+    else:
+        region, name, account_id, password = _ask(use_id)
+        if region is None:
+            return 1
+
+    if region not in BASES:
+        return _login_report(interactive, {"ok": False, "message": "Region must be us, ous or jp."}, 2)
+    if account_id and not UUID_RE.match(account_id):
+        return _login_report(interactive, {"ok": False, "message": "That is not an account ID. It looks like 8-4-4-4-12 hex characters."}, 2)
+    if not account_id and not name:
+        return _login_report(interactive, {"ok": False, "message": "An account name or account ID is required."}, 2)
+    if not password or any(ch in password for ch in "\r\n\x00") or len(password) > 200:
+        return _login_report(interactive, {"ok": False, "message": "A password is required."}, 2)
+
+    until, message, code = _backoff(dirs)
+    if code == LOCKOUT_CODE:
+        minutes = max(1, (until - now() + 59) // 60)
+        return _login_report(interactive, {"ok": False, "code": code,
+            "message": "Dexcom locked sign-in after too many attempts. Try again in %d minutes." % minutes}, 1)
+
+    creds = {"region": region, "password": password,
+             "account_name": name or None, "account_id": account_id or None}
+    base = _base_url(region)
+    try:
+        sid = _new_session(dirs, creds, base)
+        readings = fetch_readings(base, sid, 1440, 1)
+    except ShareError as err:
+        remove_file(dirs.state, "session.json")
+        if err.retry_after:
+            _set_backoff(dirs, err.retry_after, err.code, err.message)
+        return _login_report(interactive, {"ok": False, "code": err.code, "message": err.message}, 1)
+
+    write_json(dirs.config, "credentials.json", {"version": 1, **creds})
+    remove_file(dirs.state, "auth.json")
+    remove_file(dirs.state, "backoff.json")
+    write_json(dirs.state, "last.json", {"fetched_at": now(), "readings": readings})
+    latest = readings[0] if readings else None
+    return _login_report(interactive, {"ok": True, "account": account_label(creds), "region": region,
+           "latest": latest, "message": "Signed in."}, 0)
+
+
+def _ask(use_id):
+    err = sys.stderr
+    if not sys.stdin.isatty():
+        err.write("g7-share login needs a terminal (or --stdin).\n")
+        return None, None, None, None
+    err.write(
+        "\nG7 Companion sign-in\n"
+        "\n"
+        "Use the Dexcom account that the G7 app on the wearer's phone is signed into:\n"
+        "the person sharing, not a follower. Followers' accounts cannot read Share.\n"
+        "\n"
+        "The credentials are stored in ~/.config/g7-companion/credentials.json,\n"
+        "readable only by your user. Sign out from the G7 panel to delete them.\n"
+        "\n"
+        "Region  [1] United States  [2] Outside the US  [3] Japan\n"
+    )
+    try:
+        choice = input("Region [1]: ").strip() or "1"
+        region = {"1": "us", "2": "ous", "3": "jp"}.get(choice)
+        if region is None:
+            err.write("Pick 1, 2 or 3.\n")
+            return None, None, None, None
+        name = account_id = ""
+        if use_id:
+            account_id = _clean_line(input("Dexcom account ID (UUID from uam1.dexcom.com): "), 36)
+        else:
+            name = _clean_line(input("Dexcom username (email, or phone like +15551234567): "), 200)
+        password = getpass.getpass("Dexcom password: ")
+    except (EOFError, KeyboardInterrupt):
+        err.write("\nCancelled.\n")
+        return None, None, None, None
+    return region, name, account_id, password
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        sys.stderr.write(__doc__)
+        return 2
+    cmd = argv[1]
+    handlers = {"login": cmd_login, "read": cmd_read, "status": cmd_status, "logout": cmd_logout}
+    if cmd not in handlers:
+        sys.stderr.write("unknown command: %s\n" % cmd[:40])
+        return 2
+    dirs = Dirs()
+    try:
+        return handlers[cmd](dirs, argv[2:])
+    finally:
+        dirs.close()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except ShareError as exc:
+        _emit({"ok": False, "error": exc.code, "message": exc.message})
+        sys.exit(1)
+    except (OSError, PermissionError) as exc:
+        _emit({"ok": False, "error": "io", "message": re.sub(r"[\x00-\x1f]", " ", str(exc))[:200]})
+        sys.exit(1)
