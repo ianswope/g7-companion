@@ -185,12 +185,11 @@ Item {
   // Sign-in is interactive and happens in a terminal, so the password is typed
   // into getpass and never passes through the shell, a setting or an argv.
   function signIn(useAccountId) {
-    if (signInProc.running) return
     var args = ["login"]
     if (useAccountId === true) args.push("--account-id")
-    signInProc.command = ["/usr/bin/setsid", "-f", "/usr/bin/xdg-terminal-exec",
-      "--app-id=org.omarchy.terminal", "--title=G7 Companion sign-in", "-e"].concat(helperArgv(args))
-    signInProc.running = true
+    var argv = ["/usr/bin/xdg-terminal-exec", "--app-id=org.omarchy.terminal",
+      "--title=G7 Companion sign-in", "-e"].concat(helperArgv(args))
+    Quickshell.execDetached(argv)
     pollTimer.interval = 5000
     pollTimer.restart()
   }
@@ -199,12 +198,6 @@ Item {
     if (logoutProc.running) return
     logoutProc.command = helperArgv(["logout"])
     logoutProc.running = true
-  }
-
-  Process {
-    id: signInProc
-    running: false
-    command: []
   }
 
   Process {

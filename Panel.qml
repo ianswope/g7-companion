@@ -54,6 +54,8 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): void { g7.refresh() }
+    function signIn(): void { g7.signIn(false) }
+    function signInWithAccountId(): void { g7.signIn(true) }
   }
 
   TextMetrics {
