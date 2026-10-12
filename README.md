@@ -5,6 +5,8 @@ Omarchy bar, with its trend arrow. It is for the people on the other end of
 Dexcom Follow: parents, partners, anyone who wants to glance at a number on
 their computer instead of picking up their phone.
 
+<img src="preview.png" alt="The G7 Companion panel in the Omarchy bar, showing a sample reading of 142 mg/dL rising slowly with a three-hour chart" width="414">
+
 It reads the same Dexcom Share service the Follow app uses. The number updates
 about once a minute, a minute or two behind the wearer's phone.
 
