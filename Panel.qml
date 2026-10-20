@@ -58,33 +58,14 @@ Panel {
     function signInWithAccountId(): void { g7.signIn(true) }
   }
 
-  TextMetrics {
-    id: labelMetrics
-    font.family: root.fontFamily
-    font.pixelSize: Style.bar.iconFont
-    font.bold: true
-    text: g7.barText
-  }
-
-  BarIconButton {
+  // A text button, not BarIconButton: an icon slot scales whatever it holds
+  // down to icon size, which leaves "142 ↗" an empty gap in the bar.
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    slotSize: labelMetrics.width + Style.space(10)
-    iconComponent: Component {
-      Item {
-        Text {
-          anchors.centerIn: parent
-          text: g7.barText
-          textFormat: Text.PlainText
-          color: root.barValueColor
-          font.family: root.fontFamily
-          font.pixelSize: Style.bar.iconFont
-          font.bold: true
-          renderType: Text.NativeRendering
-        }
-      }
-    }
+    text: g7.barText
+    foreground: root.barValueColor
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.MiddleButton) g7.refresh()
       else root.toggle()
