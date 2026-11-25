@@ -159,6 +159,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn urgent_low_and_low_are_different_and_stale_is_grey() {
+        let urgent = band_color(Some(Band::UrgentLow), false);
+        let low = band_color(Some(Band::Low), false);
+        assert_eq!((urgent.0, urgent.1, urgent.2), (0xc6, 0x28, 0x28));
+        assert_eq!((low.0, low.1, low.2), (0xe0, 0x45, 0x3a));
+        let stale = band_color(Some(Band::UrgentLow), true);
+        assert_eq!((stale.0, stale.1, stale.2), (0x6b, 0x6f, 0x76));
+    }
+
+    #[test]
     fn icons_have_the_right_size_and_some_ink() {
         let px = reading_icon("142", Trend::DoubleUp, band_color(Some(Band::InRange), false));
         assert_eq!(px.len(), (SIZE * SIZE * 4) as usize);

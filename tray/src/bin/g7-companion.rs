@@ -21,10 +21,14 @@ enum UserEvent {
     Menu(MenuEvent),
     /// None when the person cancelled the dialog.
     SignInDone(Option<Result<Snapshot, String>>),
+    /// True when the person confirmed sign-out.
+    SignOutAnswer(bool),
 }
 
 enum Cmd {
     Refresh,
+    /// Poll quickly until this unix time while a sign-in dialog may be open.
+    WatchSignIn(i64),
 }
 
 struct Items {
@@ -112,6 +116,7 @@ fn main() {
     let mut menu = Some(menu);
     let mut last = Snapshot::default();
     let mut signing_in = false;
+    let mut confirming_sign_out = false;
 
     event_loop.run(move |event, _, control_flow| {
         // Wake every 15 seconds so ages and staleness move between polls.
@@ -144,6 +149,17 @@ fn main() {
                     render(t, &items, &store, &last);
                 }
             }
+            Event::UserEvent(UserEvent::SignOutAnswer(yes)) => {
+                confirming_sign_out = false;
+                if !yes {
+                    return;
+                }
+                let _ = store.clear();
+                last = Snapshot { message: "Not signed in.".into(), ..Default::default() };
+                if let Some(t) = &tray {
+                    render(t, &items, &store, &last);
+                }
+            }
             Event::UserEvent(UserEvent::SignInDone(result)) => {
                 signing_in = false;
                 let Some(result) = result else { return };
@@ -169,6 +185,7 @@ fn main() {
                     let _ = cmd_tx.send(Cmd::Refresh);
                 } else if (id == items.sign_in.id() || id == items.sign_in_id.id()) && !signing_in {
                     signing_in = true;
+                    let _ = cmd_tx.send(Cmd::WatchSignIn(now() + poller::SIGN_IN_WATCH_SECONDS));
                     let by_id = id == items.sign_in_id.id();
                     let proxy = proxy.clone();
                     thread::spawn(move || {
@@ -178,12 +195,16 @@ fn main() {
                         });
                         let _ = proxy.send_event(UserEvent::SignInDone(result));
                     });
-                } else if id == items.sign_out.id() {
-                    let _ = store.clear();
-                    last = Snapshot { message: "Not signed in.".into(), ..Default::default() };
-                    if let Some(t) = &tray {
-                        render(t, &items, &store, &last);
-                    }
+                } else if id == items.sign_out.id() && last.signed_in && !confirming_sign_out {
+                    confirming_sign_out = true;
+                    let proxy = proxy.clone();
+                    thread::spawn(move || {
+                        let yes = platform::confirm(
+                            "Sign out and delete the stored password and cached readings? Signing in again means typing that password again.",
+                            "Sign out",
+                        );
+                        let _ = proxy.send_event(UserEvent::SignOutAnswer(yes));
+                    });
                 } else if id == items.mmol.id() {
                     let mut s = store.load_settings();
                     s.unit = if items.mmol.is_checked() { model::Unit::Mmol } else { model::Unit::Mgdl };
@@ -213,18 +234,31 @@ fn worker(rx: mpsc::Receiver<Cmd>, proxy: tao::event_loop::EventLoopProxy<UserEv
         Ok(s) => s,
         Err(_) => return,
     };
+    let mut sign_in_until = 0i64;
     loop {
         let snap = poller::poll(&store, &Client::new, 180);
-        let wait = poller::next_poll_secs(&snap, store.load_settings().refresh_sec());
+        let wait = poller::next_poll_secs(
+            store.load_settings().refresh_sec(),
+            sign_in_until,
+            snap.backoff_until,
+            now(),
+        );
         if proxy.send_event(UserEvent::Snapshot(snap)).is_err() {
             return;
         }
-        match rx.recv_timeout(Duration::from_secs(wait)) {
-            Ok(Cmd::Refresh) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+        let cmd = match rx.recv_timeout(Duration::from_secs(wait)) {
+            Ok(cmd) => Some(cmd),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        // Drain extra clicks so a burst becomes one poll. A sign-in watch
+        // that arrives in the burst still has to be remembered.
+        let mut pending = cmd.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok()));
+        for cmd in pending.by_ref() {
+            if let Cmd::WatchSignIn(until) = cmd {
+                sign_in_until = until;
+            }
         }
-        // Drain extra refresh clicks so a burst becomes one poll.
-        while rx.try_recv().is_ok() {}
     }
 }
 

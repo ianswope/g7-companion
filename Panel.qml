@@ -18,16 +18,29 @@ Panel {
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color background: bar ? bar.background : Color.background
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
+  // Same two reds as the menu-bar app: darker under the urgent-low line,
+  // lighter between that and the ordinary low line.
+  readonly property color urgentLowColor: "#c62828"
+  readonly property color lowColor: "#e0453a"
   readonly property color highColor: "#e8a33d"
   readonly property color staleColor: Qt.darker(barForeground, 1.8)
+  property bool signOutConfirmOpen: false
 
   function bandColor(band, base) {
-    if (band === "urgentLow" || band === "low") return root.urgent
+    if (band === "urgentLow") return root.urgentLowColor
+    if (band === "low") return root.lowColor
     if (band === "high") return root.highColor
     return base
+  }
+
+  function askSignOut() {
+    signOutConfirm.selectedIndex = 0
+    signOutConfirmOpen = true
+    Qt.callLater(function() { signOutConfirm.forceActiveFocus() })
   }
 
   // A stale reading goes grey whatever its value was. A coloured number that
@@ -39,7 +52,14 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  onOpenedChanged: if (opened) { g7.refresh(); Qt.callLater(function() { keyCatcher.forceActiveFocus() }) }
+  onOpenedChanged: {
+    if (opened) {
+      g7.refresh()
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    } else {
+      signOutConfirmOpen = false
+    }
+  }
 
   Service {
     id: g7
@@ -85,6 +105,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: root.signOutConfirmOpen
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
@@ -172,7 +193,7 @@ Panel {
             id: spark
             anchors.fill: parent
             readonly property real yMin: 40
-            readonly property real yMax: 300
+            readonly property real yMax: 400
             property var points: Model.sparkPoints(g7.readings, g7.now, g7.historyMinutes, yMin, yMax)
             onPointsChanged: requestPaint()
             onWidthChanged: requestPaint()
@@ -296,7 +317,7 @@ Panel {
             foreground: root.dim
             fontFamily: root.fontFamily
             visible: g7.signedIn
-            onClicked: g7.signOut()
+            onClicked: root.askSignOut()
           }
         }
 
@@ -332,6 +353,28 @@ Panel {
           horizontalAlignment: Text.AlignHCenter
           wrapMode: Text.WordWrap
         }
+      }
+
+      ConfirmDialog {
+        id: signOutConfirm
+        anchors.fill: parent
+        z: 30
+        opened: root.signOutConfirmOpen
+        focus: opened
+        message: "Sign out and delete the stored password and cached readings? You will need the wearer's password to sign in again."
+        confirmText: "Sign out"
+        background: root.background
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        Keys.onPressed: function(event) {
+          if (handleKey(event)) event.accepted = true
+        }
+        onCanceled: root.signOutConfirmOpen = false
+        onConfirmed: {
+          root.signOutConfirmOpen = false
+          g7.signOut()
+        }
+        onOpenedChanged: if (!opened && root.opened) keyCatcher.forceActiveFocus()
       }
     }
   }

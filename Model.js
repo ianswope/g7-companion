@@ -126,12 +126,18 @@ function ageSeconds(reading, nowSeconds) {
   return Math.max(0, nowSeconds - reading.t)
 }
 
+// Keep the leftover minutes for the first few hours. "1h" for a reading that
+// is really an hour and fifty minutes is the lie this widget exists to avoid.
+var AGE_MINUTE_HOURS = 6
+
 function formatAge(seconds) {
   if (seconds < 0) return ""
   if (seconds < 60) return "now"
   var m = Math.floor(seconds / 60)
   if (m < 60) return m + "m"
   var h = Math.floor(m / 60)
+  var rem = m % 60
+  if (h < AGE_MINUTE_HOURS && rem > 0) return h + "h " + rem + "m"
   if (h < 48) return h + "h"
   return Math.floor(h / 24) + "d"
 }
@@ -142,6 +148,12 @@ function formatAgeLong(seconds) {
   var m = Math.floor(seconds / 60)
   if (m < 60) return m === 1 ? "1 minute ago" : m + " minutes ago"
   var h = Math.floor(m / 60)
+  var rem = m % 60
+  if (h < AGE_MINUTE_HOURS && rem > 0) {
+    var hours = h === 1 ? "1 hour" : h + " hours"
+    var minutes = rem === 1 ? "1 minute" : rem + " minutes"
+    return hours + " " + minutes + " ago"
+  }
   if (h < 48) return h === 1 ? "1 hour ago" : h + " hours ago"
   var d = Math.floor(h / 24)
   return d + " days ago"
@@ -205,11 +217,15 @@ function thresholds(settings) {
   return { urgentLow: urgentLow, low: low, high: high }
 }
 
-// Seconds until the next poll. Fast while signed out (the check is local and
-// costs nothing), the configured cadence while healthy, and never before a
-// back-off Dexcom asked for.
+// How long to poll quickly after Sign in is clicked, so the bar notices the
+// new session without forking the helper every few seconds while signed out.
+var SIGN_IN_WATCH_SECONDS = 300
+
+// Seconds until the next poll. The configured cadence, including while signed
+// out. During the sign-in watch, poll quickly. Never poll before a back-off
+// Dexcom asked for.
 function nextPollSeconds(state, refreshSec, nowSeconds) {
-  if (state.needsLogin) return 5
+  if (state.signingInUntil > nowSeconds) return 5
   if (state.retryAfter > nowSeconds) return Math.max(refreshSec, state.retryAfter - nowSeconds + 1)
   return refreshSec
 }

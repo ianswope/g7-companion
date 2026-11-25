@@ -223,14 +223,36 @@ pub fn sign_in_with(store: &Store, client_for: &dyn Fn(Region) -> Client, secret
     })
 }
 
-/// When to poll next, in seconds.
-pub fn next_poll_secs(snap: &Snapshot, refresh_sec: u64) -> u64 {
-    if !snap.signed_in || snap.needs_login {
-        return 30;
+/// How long the menu bar polls quickly after Sign in is clicked. Same window
+/// as the Omarchy bar: long enough to finish the dialog, then back to the
+/// normal cadence, including while signed out.
+pub const SIGN_IN_WATCH_SECONDS: i64 = 300;
+const SIGN_IN_POLL_SECONDS: u64 = 5;
+
+/// When to poll next, in seconds. `signing_in_until` and `backoff_until` are
+/// unix times; pass 0 when they are not in force.
+pub fn next_poll_secs(refresh_sec: u64, signing_in_until: i64, backoff_until: i64, now_secs: i64) -> u64 {
+    if signing_in_until > now_secs {
+        return SIGN_IN_POLL_SECONDS;
     }
-    let wait = snap.backoff_until - now();
+    let wait = backoff_until.saturating_sub(now_secs);
     if wait > 0 {
         return refresh_sec.max(wait as u64 + 1);
     }
     refresh_sec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_760_112_345;
+
+    #[test]
+    fn poll_cadence_matches_the_bar() {
+        assert_eq!(next_poll_secs(60, 0, 0, NOW), 60);
+        assert_eq!(next_poll_secs(60, NOW + 30, 0, NOW), 5);
+        assert_eq!(next_poll_secs(60, NOW - 1, 0, NOW), 60);
+        assert_eq!(next_poll_secs(60, 0, NOW + 1800, NOW), 1801);
+    }
 }

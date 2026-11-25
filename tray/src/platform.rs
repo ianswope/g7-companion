@@ -146,6 +146,51 @@ exit 0
     }
 }
 
+/// Ask before deleting the stored password. False if the person cancels or
+/// the dialog cannot be shown. Cancel is the default button, so Enter does
+/// not sign out. Blocks until dismissed; call it off the UI thread.
+pub fn confirm(message: &str, confirm_label: &str) -> bool {
+    let msg = plain(message, 400);
+    let label = plain(confirm_label, 40);
+    if msg.is_empty() || label.is_empty() {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            r#"display dialog "{msg}" with title "{APP_NAME}" buttons {{"Cancel", "{label}"}} default button "Cancel" cancel button "Cancel""#
+        );
+        let mut cmd = Command::new("/usr/bin/osascript");
+        cmd.arg("-");
+        return run_capture(cmd, Some(&script)).is_some();
+    }
+    #[cfg(windows)]
+    {
+        // Yes/No, with No (Button2) focused. The message names the action.
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms\n\
+             $r = [System.Windows.Forms.MessageBox]::Show('{msg}', '{APP_NAME}', 'YesNo', 'Question', 'Button2')\n\
+             if ($r -ne 'Yes') {{ exit 1 }}\n"
+        );
+        return run_capture(powershell(&script), None).is_some();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut cmd = Command::new("/usr/bin/zenity");
+        cmd.args([
+            "--question",
+            &format!("--title={APP_NAME}"),
+            "--no-markup",
+            "--default-cancel",
+            "--cancel-label=Cancel",
+            &format!("--ok-label={label}"),
+            "--text",
+            &msg,
+        ]);
+        run_capture(cmd, None).is_some()
+    }
+}
+
 /// A message box. Blocks until dismissed, so call it off the UI thread.
 pub fn alert(message: &str) {
     let msg = plain(message, 400);

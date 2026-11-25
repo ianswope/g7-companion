@@ -29,6 +29,10 @@ Item {
   readonly property int staleMinutes: Model.clampInt(setting("staleMinutes", 10), 10, 6, 60)
   readonly property int historyMinutes: Model.clampInt(setting("historyMinutes", 180), 180, 60, 720)
 
+  // Set while a sign-in terminal may still be open. Idle and signed-out polls
+  // stay on the normal cadence; this is the only reason to check every few seconds.
+  property int signInUntil: 0
+
   // ── what the helper last said ─────────────────────────────────────────────
   property bool ready: false
   property bool signedIn: false
@@ -108,7 +112,7 @@ Item {
 
   function schedule() {
     pollTimer.interval = Model.nextPollSeconds(
-      { needsLogin: needsLogin || !signedIn, retryAfter: retryAfter }, refreshSec, now) * 1000
+      { signingInUntil: signInUntil, retryAfter: retryAfter }, refreshSec, now) * 1000
     pollTimer.restart()
   }
 
@@ -190,6 +194,8 @@ Item {
     var argv = ["/usr/bin/xdg-terminal-exec", "--app-id=org.omarchy.terminal",
       "--title=G7 Companion sign-in", "-e"].concat(helperArgv(args))
     Quickshell.execDetached(argv)
+    now = Math.floor(Date.now() / 1000)
+    signInUntil = now + Model.SIGN_IN_WATCH_SECONDS
     pollTimer.interval = 5000
     pollTimer.restart()
   }

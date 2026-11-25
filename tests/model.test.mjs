@@ -81,6 +81,7 @@ test("the bar never shows a stale number without its age", () => {
   const opts = { unit: "mgdl", staleMinutes: 10, signedIn: true };
   assert.equal(M.barLabel({ t: NOW - 120, v: 142, trend: "Flat" }, NOW, opts), "142 →");
   assert.equal(M.barLabel({ t: NOW - 11 * 60, v: 142, trend: "Flat" }, NOW, opts), "142 → 11m");
+  assert.equal(M.barLabel({ t: NOW - 83 * 60, v: 142, trend: "Flat" }, NOW, opts), "142 → 1h 23m");
   assert.equal(M.barLabel({ t: NOW - 3 * 3600, v: 142, trend: "Flat" }, NOW, opts), "142 → 3h");
   assert.equal(M.barLabel({ t: NOW - 120, v: 142, trend: "Flat" }, NOW, { ...opts, alwaysShowAge: true }), "142 → 2m");
   assert.equal(M.barLabel({ t: NOW - 120, v: 142, trend: "Flat" }, NOW, { ...opts, showTrend: false }), "142");
@@ -92,7 +93,12 @@ test("the bar never shows a stale number without its age", () => {
 test("ages", () => {
   assert.equal(M.formatAge(30), "now");
   assert.equal(M.formatAge(5 * 60), "5m");
+  assert.equal(M.formatAge(119 * 60), "1h 59m");
+  assert.equal(M.formatAge(2 * 3600), "2h");
+  assert.equal(M.formatAge(6 * 3600 + 20 * 60), "6h");
   assert.equal(M.formatAgeLong(60), "1 minute ago");
+  assert.equal(M.formatAgeLong(61 * 60), "1 hour 1 minute ago");
+  assert.equal(M.formatAgeLong(119 * 60), "1 hour 59 minutes ago");
   assert.equal(M.formatAgeLong(7200), "2 hours ago");
 });
 
@@ -105,15 +111,18 @@ test("headline", () => {
 
 test("sparkline points stay in the window and the unit square", () => {
   const readings = [{ t: NOW, v: 400 }, { t: NOW - 5400, v: 100 }, { t: NOW - 20000, v: 100 }];
-  const pts = M.sparkPoints(readings, NOW, 180, 40, 300);
+  const pts = M.sparkPoints(readings, NOW, 180, 40, 400);
   assert.equal(pts.length, 2);
   assert.equal(pts[1].x, 1);
   assert.equal(pts[1].y, 1);
   assert.ok(pts.every(p => p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1));
+  const below = M.sparkPoints([{ t: NOW, v: 300 }], NOW, 180, 40, 400);
+  assert.ok(below[0].y < 1);
 });
 
 test("polling never runs ahead of a Dexcom back-off", () => {
-  assert.equal(M.nextPollSeconds({ needsLogin: true, retryAfter: 0 }, 60, NOW), 5);
-  assert.equal(M.nextPollSeconds({ needsLogin: false, retryAfter: 0 }, 60, NOW), 60);
-  assert.equal(M.nextPollSeconds({ needsLogin: false, retryAfter: NOW + 1800 }, 60, NOW), 1801);
+  assert.equal(M.nextPollSeconds({ signingInUntil: 0, retryAfter: 0 }, 60, NOW), 60);
+  assert.equal(M.nextPollSeconds({ signingInUntil: NOW + 30, retryAfter: 0 }, 60, NOW), 5);
+  assert.equal(M.nextPollSeconds({ signingInUntil: NOW - 1, retryAfter: 0 }, 60, NOW), 60);
+  assert.equal(M.nextPollSeconds({ signingInUntil: 0, retryAfter: NOW + 1800 }, 60, NOW), 1801);
 });

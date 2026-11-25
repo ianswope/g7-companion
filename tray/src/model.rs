@@ -69,6 +69,10 @@ pub fn age_seconds(r: &Reading, now: i64) -> i64 {
     (now - r.t).max(0)
 }
 
+/// Hours during which a leftover number of minutes is still shown. Past this,
+/// whole hours are enough; before it, "1h" would hide almost an hour.
+const AGE_MINUTE_HOURS: i64 = 6;
+
 pub fn format_age(seconds: i64) -> String {
     if seconds < 60 {
         return "now".into();
@@ -77,7 +81,10 @@ pub fn format_age(seconds: i64) -> String {
     if m < 60 {
         return format!("{m}m");
     }
-    let h = m / 60;
+    let (h, rem) = (m / 60, m % 60);
+    if h < AGE_MINUTE_HOURS && rem > 0 {
+        return format!("{h}h {rem}m");
+    }
     if h < 48 {
         return format!("{h}h");
     }
@@ -92,7 +99,12 @@ pub fn format_age_long(seconds: i64) -> String {
     if m < 60 {
         return if m == 1 { "1 minute ago".into() } else { format!("{m} minutes ago") };
     }
-    let h = m / 60;
+    let (h, rem) = (m / 60, m % 60);
+    if h < AGE_MINUTE_HOURS && rem > 0 {
+        let hours = if h == 1 { "1 hour".to_string() } else { format!("{h} hours") };
+        let minutes = if rem == 1 { "1 minute".to_string() } else { format!("{rem} minutes") };
+        return format!("{hours} {minutes} ago");
+    }
     if h < 48 {
         return if h == 1 { "1 hour ago".into() } else { format!("{h} hours ago") };
     }
@@ -171,6 +183,7 @@ mod tests {
     fn labels() {
         assert_eq!(bar_label(Some(&r(120, 142, Trend::Flat)), NOW, Unit::Mgdl, 10, true), "142 →");
         assert_eq!(bar_label(Some(&r(660, 142, Trend::Flat)), NOW, Unit::Mgdl, 10, true), "142 → 11m");
+        assert_eq!(bar_label(Some(&r(83 * 60, 142, Trend::Flat)), NOW, Unit::Mgdl, 10, true), "142 → 1h 23m");
         assert_eq!(bar_label(Some(&r(60, 54, Trend::DoubleDown)), NOW, Unit::Mmol, 10, true), "3.0 ⇊");
         assert_eq!(bar_label(None, NOW, Unit::Mgdl, 10, true), "G7 --");
         assert_eq!(bar_label(None, NOW, Unit::Mgdl, 10, false), "G7");
@@ -198,7 +211,12 @@ mod tests {
     #[test]
     fn ages() {
         assert_eq!(format_age(30), "now");
+        assert_eq!(format_age(119 * 60), "1h 59m");
         assert_eq!(format_age(7200), "2h");
+        assert_eq!(format_age(6 * 3600 + 20 * 60), "6h");
         assert_eq!(format_age_long(60), "1 minute ago");
+        assert_eq!(format_age_long(61 * 60), "1 hour 1 minute ago");
+        assert_eq!(format_age_long(119 * 60), "1 hour 59 minutes ago");
+        assert_eq!(format_age_long(7200), "2 hours ago");
     }
 }
