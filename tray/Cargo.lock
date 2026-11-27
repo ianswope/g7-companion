@@ -793,10 +793,13 @@ dependencies = [
 
 [[package]]
 name = "g7-companion"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dirs",
  "keyring",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rpassword",
  "serde",
  "serde_json",

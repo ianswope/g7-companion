@@ -16,6 +16,10 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+#[cfg(target_os = "macos")]
+#[path = "macos_chart/mod.rs"]
+mod macos_chart;
+
 enum UserEvent {
     Snapshot(Snapshot),
     Menu(MenuEvent),
@@ -93,12 +97,19 @@ fn main() {
         quit: MenuItem::new("Quit G7 Companion", true, None),
     };
     let menu = Menu::new();
+    // macOS draws the reading and the chart itself, as the first row, once the
+    // menu exists. The text rows would only repeat it.
+    #[cfg(target_os = "macos")]
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    #[cfg(not(target_os = "macos"))]
     let _ = menu.append_items(&[
         &items.value,
         &items.detail,
         &items.change,
         &items.status,
         &PredefinedMenuItem::separator(),
+    ]);
+    let _ = menu.append_items(&[
         &items.refresh,
         &items.sign_in,
         &items.sign_in_id,
@@ -113,6 +124,8 @@ fn main() {
     ]);
 
     let mut tray: Option<TrayIcon> = None;
+    #[cfg(target_os = "macos")]
+    let mut chart: Option<macos_chart::Slot> = None;
     let mut menu = Some(menu);
     let mut last = Snapshot::default();
     let mut signing_in = false;
@@ -124,6 +137,10 @@ fn main() {
         match event {
             Event::NewEvents(StartCause::Init) => {
                 // macOS needs the status item created once the loop runs.
+                #[cfg(target_os = "macos")]
+                {
+                    chart = Some(macos_chart::attach(menu.as_ref().expect("menu")));
+                }
                 let built = TrayIconBuilder::new()
                     .with_menu(Box::new(menu.take().expect("menu")))
                     .with_tooltip("G7 Companion")
@@ -131,7 +148,13 @@ fn main() {
                     .with_icon(make_icon(&store, &last).0)
                     .build();
                 match built {
-                    Ok(t) => tray = Some(t),
+                    Ok(t) => {
+                        #[cfg(target_os = "macos")]
+                        render(&t, &items, &store, &last, chart.as_ref());
+                        #[cfg(not(target_os = "macos"))]
+                        render(&t, &items, &store, &last);
+                        tray = Some(t);
+                    }
                     Err(e) => {
                         platform::alert(&format!("G7 Companion could not add its icon: {e}"));
                         *control_flow = ControlFlow::Exit;
@@ -140,12 +163,18 @@ fn main() {
             }
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 if let Some(t) = &tray {
+                    #[cfg(target_os = "macos")]
+                    render(t, &items, &store, &last, chart.as_ref());
+                    #[cfg(not(target_os = "macos"))]
                     render(t, &items, &store, &last);
                 }
             }
             Event::UserEvent(UserEvent::Snapshot(s)) => {
                 last = s;
                 if let Some(t) = &tray {
+                    #[cfg(target_os = "macos")]
+                    render(t, &items, &store, &last, chart.as_ref());
+                    #[cfg(not(target_os = "macos"))]
                     render(t, &items, &store, &last);
                 }
             }
@@ -157,6 +186,9 @@ fn main() {
                 let _ = store.clear();
                 last = Snapshot { message: "Not signed in.".into(), ..Default::default() };
                 if let Some(t) = &tray {
+                    #[cfg(target_os = "macos")]
+                    render(t, &items, &store, &last, chart.as_ref());
+                    #[cfg(not(target_os = "macos"))]
                     render(t, &items, &store, &last);
                 }
             }
@@ -167,6 +199,9 @@ fn main() {
                     Ok(s) => {
                         last = s;
                         if let Some(t) = &tray {
+                            #[cfg(target_os = "macos")]
+                            render(t, &items, &store, &last, chart.as_ref());
+                            #[cfg(not(target_os = "macos"))]
                             render(t, &items, &store, &last);
                         }
                         let _ = cmd_tx.send(Cmd::Refresh);
@@ -210,6 +245,9 @@ fn main() {
                     s.unit = if items.mmol.is_checked() { model::Unit::Mmol } else { model::Unit::Mgdl };
                     let _ = store.save_settings(&s);
                     if let Some(t) = &tray {
+                        #[cfg(target_os = "macos")]
+                        render(t, &items, &store, &last, chart.as_ref());
+                        #[cfg(not(target_os = "macos"))]
                         render(t, &items, &store, &last);
                     }
                 } else if id == items.autostart.id() {
@@ -236,7 +274,7 @@ fn worker(rx: mpsc::Receiver<Cmd>, proxy: tao::event_loop::EventLoopProxy<UserEv
     };
     let mut sign_in_until = 0i64;
     loop {
-        let snap = poller::poll(&store, &Client::new, 180);
+        let snap = poller::poll(&store, &Client::new, model::HISTORY_MINUTES as u32);
         let wait = poller::next_poll_secs(
             store.load_settings().refresh_sec(),
             sign_in_until,
@@ -281,7 +319,13 @@ fn make_icon(store: &Store, snap: &Snapshot) -> (Icon, String) {
     (icon, label)
 }
 
-fn render(tray: &TrayIcon, items: &Items, store: &Store, snap: &Snapshot) {
+fn render(
+    tray: &TrayIcon,
+    items: &Items,
+    store: &Store,
+    snap: &Snapshot,
+    #[cfg(target_os = "macos")] chart: Option<&macos_chart::Slot>,
+) {
     let settings = store.load_settings();
     let t = now();
     let (icon, label) = make_icon(store, snap);
@@ -341,4 +385,8 @@ fn render(tray: &TrayIcon, items: &Items, store: &Store, snap: &Snapshot) {
     items.refresh.set_enabled(snap.signed_in && !snap.needs_login);
     items.sign_out.set_enabled(snap.signed_in);
     items.mmol.set_checked(settings.unit == model::Unit::Mmol);
+    #[cfg(target_os = "macos")]
+    if let Some(chart) = chart {
+        chart.sync(store, snap);
+    }
 }

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ianswope.g7-companion",
   "name": "G7 Companion",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Ian Swope",
   "license": "MIT",
   "description": "The latest Dexcom G7 glucose reading in the bar, read from Dexcom Share the way the Follow app does, with trend, age and a three-hour sparkline. For parents and partners following someone's CGM.",

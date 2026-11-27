@@ -99,8 +99,8 @@ out of battery or is out of range of the sensor, the last number stays on
 screen, so G7 Companion greys it out and shows how old it is after ten minutes
 instead of letting it look current.
 
-Click the reading for the last three hours as a chart (Omarchy) or the trend
-and change since the previous reading (macOS and Windows).
+Click the reading for the last three hours as a chart (Omarchy and macOS) or
+the trend and change since the previous reading (Windows).
 
 Set the low and high thresholds to match the ones in your Follow app. On
 macOS and Windows, **Edit thresholds…** opens the settings file; change

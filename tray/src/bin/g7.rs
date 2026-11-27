@@ -115,7 +115,7 @@ fn login(store: &Store, args: &[String]) -> ExitCode {
 }
 
 fn read(store: &Store, json: bool) -> ExitCode {
-    let snap = poller::poll(store, &Client::new, 180);
+    let snap = poller::poll(store, &Client::new, model::HISTORY_MINUTES as u32);
     let settings = store.load_settings();
     if json {
         let doc = serde_json::json!({
